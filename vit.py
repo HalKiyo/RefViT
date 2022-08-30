@@ -16,8 +16,8 @@ num_classes = 100
 input_shape = (32, 32, 3)
 
 (x_train, y_train), (x_test, y_test) = keras.datasets.cifar100.load_data()
-print(f"x_train shape: {x_train.shape} - y_train shape: {y_train.shape}")
-print(f"x_test shape: {x_test.shape} - y_test shape: {y_test.shape}")
+#>>x_train shape: (50000, 32, 32, 3) - y_train shape: (50000, 1)
+#>>x_test shape: (10000, 32, 32, 3) - y_test shape: (10000, 1)
 
 # ---Configure the hyperparameters---
 learning_rate = 0.001
@@ -45,7 +45,7 @@ data_augmentation = keras.Sequential(
             layers.RandomRotation(factor=0.02),
             layers.RandomZoom(
                 height_factor=0.2, width_factor=0.2
-                ),
+            ),
         ],
         name="data_augmentation",
 )
@@ -65,6 +65,13 @@ class Patches(layers.Layer):
         super(Patches, self).__init__()
         self.patch_size = patch_size
 
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'patch_size': self.patch_size
+        })
+        return config
+
     def call(self, images): # images[1,72,72,3]
         batch_size = tf.shape(images)[0]
         patches = tf.image.extract_patches(
@@ -75,8 +82,7 @@ class Patches(layers.Layer):
                 padding="VALID",
         )
         patch_dims = patches.shape[-1] # patches[1, 12, 12, 108] -> 108
-        patches = tf.reshape(patches, [batch_size, -1, patch_dims])
-        print(patches.shape)
+        patches = tf.reshape(patches, [batch_size, -1, patch_dims]) # patches[1, 144, 108]
         return patches
 
 # Let's display patches for a sample image
@@ -105,7 +111,7 @@ def plot(x_train):
 
 # ---Implement the patch encoding layer---
 # The PatchEncoder layer will linearly transform a patch 
-# by projection in into a vector of size projection_dim. In addition,
+# by projection it into a vector of size projection_dim. In addition,
 # it adds a learnable postition embedding to the projected vector.
 class PatchEncoder(layers.Layer):
     def __init__(self, num_patches, projection_dim):
@@ -113,13 +119,114 @@ class PatchEncoder(layers.Layer):
         self.num_patches = num_patches
         self.projection = layers.Dense(units=projection_dim)
         self.position_embedding = layers.Embedding(
-                input_dim=num_patches, ouput_dim=projection_dim
+                input_dim=num_patches, output_dim=projection_dim
         )
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_patches": self.num_patches,
+        })
+        return config
 
     def call(self, patch):
         positions = tf.range(start=0, limit=self.num_patches, delta=1)
         encoded = self.projection(patch) + self.position_embedding(positions)
         return encoded
 
+# ---Build the ViT model---
+# The ViT model consists of multiple Transformer blocks, which use the layers.MultiAttention layer
+# as a self-attention mechanism applied to the sequence of patches. 
+# The Transformer blocks produce a [batch_size, num_patches, projection_dim] tensor, 
+# Which is processed via an classifier head with softmax to produce the final class probablilities output.
+# Unlike the technique described in the paper, which prepends a learnable embedding to the sequence
+# of encoded patches to serve as the image representation, all the ouputs of the final Transformer
+# block are reshaped with layers.Flatten() and used as the image representation input to the classifier
+# head. Note that the layers.GlobalAveragePooling1D layer could also be used instead to aggregate 
+# the outputs of the Transformer block, especially when the number of patches and the projection 
+# dimensions are large
+def create_vit_classifier():
+    inputs = layers.Input(shape=input_shape)
+    # Augment data.
+    augmented = data_augmentation(inputs)
+    # Create patches.
+    patches = Patches(patch_size)(augmented)
+    # Encode patches.
+    encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
+
+    # Create multiple layers of the Transformer block.
+    for _ in range(transformer_layers):
+        # Layer normalization 1.
+        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+        # Create a multi-head attention layer.
+        attention_output = layers.MultiHeadAttention(
+                num_heads=num_heads, key_dim=projection_dim, dropout=0.1
+        )(x1, x1)
+        # Skip connection 1.
+        x2 = layers.Add()([attention_output, encoded_patches])
+        # Layer normalization 2.
+        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
+        # MLP.
+        x3 = mlp(x3, hidden_units=transformer_units, dropout_rate=0.1)
+        # Skip connection 2.
+        encoded_patches = layers.Add()([x3, x2])
+
+    # Create a [batch_size, projection_dim] tensor.
+    representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+    representation = layers.Flatten()(representation)
+    representation = layers.Dropout(0.5)(representation)
+    # Add MLP.
+    features = mlp(representation, hidden_units=mlp_head_units, dropout_rate=0.5)
+    # Classify outputs.
+    logits = layers.Dense(num_classes)(features)
+    # Create the Keras model.
+    model = keras.Model(inputs=inputs, outputs=logits)
+    return model
+
+# ---Compile, train, and evaluate the model---
+def run_experiment(model):
+    optimizer = tfa.optimizers.AdamW(
+            learning_rate=learning_rate, weight_decay=weight_decay
+    )
+
+    model.compile(
+            optimizer=optimizer,
+            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+            metrics=[
+                keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
+                keras.metrics.SparseTopKCategoricalAccuracy(5, name="top-5-accuracy"),
+            ],
+    )
+
+    checkpoint_filepath = "best_pool.h5"
+    checkpoint_callback = keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_filepath,
+            monitor="val_accuracy",
+            save_best_only=True,
+    )
+
+    history = model.fit(
+            x=x_train,
+            y=y_train,
+            batch_size=batch_size,
+            epochs=num_epochs,
+            validation_split=0.1,
+            callbacks=[checkpoint_callback]
+    )
+
+    model.load_weights(checkpoint_filepath)
+    _, accuracy, top_5_accuracy = model.evaluate(x_test, y_test)
+    print(f"Test accuracy: {round(accuracy * 100, 2)}%")
+    print(f"Test top 5 accuracy: {round(top_5_accuracy * 100, 2)}%")
+
+    return history
+
+
 if __name__ == "__main__":
-    print('done')
+    try:
+        vit_classifier = create_vit_classifier()
+        history = run_experiment(vit_classifier)
+        print('[\N{check mark}]')
+    except Exception as e:
+        print('[\N{cross mark}]')
+        print(e)
